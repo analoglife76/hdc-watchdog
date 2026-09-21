@@ -1,0 +1,50 @@
+# Outside-in uptime check. Runs on GitHub's infrastructure, independent of the sites it checks.
+# Logs print verdicts only, never a response body. The one secret is a key that can do nothing
+# except record that this check ran.
+name: Watchdog
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Portal heartbeat
+        run: |
+          body=$(curl -sS --max-time 20 "https://staff.headshotdc.com/api/watch/heartbeat" 2>/dev/null || echo CURL_FAILED)
+          case "$body" in
+            *'"ok":true'*) echo "portal: healthy";;
+            *) echo "::error::Portal heartbeat unhealthy"; echo "FAIL_HEARTBEAT=1" >> "$GITHUB_ENV";;
+          esac
+          case "$body" in
+            *'"alarm_armed":true'*) echo "edge alarm: armed";;
+            *) echo "::error::Edge alarm not armed"; echo "FAIL_HEARTBEAT=1" >> "$GITHUB_ENV";;
+          esac
+      - name: Storefront
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://www.headshotdc.com/" 2>/dev/null || echo 000)
+          echo "www status: $code"
+          if [ "$code" != "200" ]; then echo "::error::www answered $code"; echo "FAIL_WWW=1" >> "$GITHUB_ENV"; fi
+      - name: Report the beat
+        env:
+          BEAT_KEY: ${{ secrets.WD_BEAT_KEY }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H "x-hdc-beat-key: $BEAT_KEY" "https://staff.headshotdc.com/api/watchdog/beat?via=github" 2>/dev/null || echo 000)
+          echo "beat: $code"
+      - name: Verdict
+        run: |
+          if [ -n "$FAIL_HEARTBEAT" ] || [ -n "$FAIL_WWW" ]; then
+            echo "::error::Watchdog checks FAILED - this failed run is the alarm (GitHub emails it)."
+            exit 1
+          fi
+          echo "all green"
