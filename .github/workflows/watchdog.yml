@@ -44,21 +44,27 @@ jobs:
 
       # n1190 · certificate and domain expiry, read from outside (Better Stack's own expiry checks are a paid
       # feature). The soonest certificate of the two hosts, and headshotdc.com's registration from the .com
-      # registry (RDAP). Under 14 days for a certificate or 30 for the domain fails the run, which GitHub
-      # emails. An unreadable date is reported as unread and does not fail the run on its own.
+      # registry (RDAP). The days go to the portal with the beat; the PORTAL raises the alarm (source
+      # `expiry`, once a day), because a failing run here would email on every run. This step never fails the
+      # run and never stops the beat: anything unreadable is sent as empty and shown as unread.
       - name: Certificate and domain expiry
+        continue-on-error: true
         run: |
+          set +e
           now=$(date -u +%s); ssl_days=""
           for h in staff.headshotdc.com www.headshotdc.com; do
             end=$(echo | timeout 15 openssl s_client -servername "$h" -connect "$h:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
-            if [ -n "$end" ]; then d=$(( ( $(date -u -d "$end" +%s) - now ) / 86400 )); echo "$h certificate: $d days"; if [ -z "$ssl_days" ] || [ "$d" -lt "$ssl_days" ]; then ssl_days=$d; fi
+            t=$(date -u -d "$end" +%s 2>/dev/null)
+            if [ -n "$end" ] && [ -n "$t" ]; then d=$(( ( t - now ) / 86400 )); echo "$h certificate: $d days"; if [ -z "$ssl_days" ] || [ "$d" -lt "$ssl_days" ]; then ssl_days=$d; fi
             else echo "$h certificate: unread"; fi
           done
           dom=$(curl -s --max-time 20 https://rdap.verisign.com/com/v1/domain/headshotdc.com | jq -r '.events[]? | select(.eventAction=="expiration") | .eventDate' 2>/dev/null | head -1)
-          domain_days=""; if [ -n "$dom" ]; then domain_days=$(( ( $(date -u -d "$dom" +%s) - now ) / 86400 )); echo "headshotdc.com domain: $domain_days days"; else echo "headshotdc.com domain: unread"; fi
+          t=$(date -u -d "$dom" +%s 2>/dev/null)
+          domain_days=""; if [ -n "$dom" ] && [ -n "$t" ]; then domain_days=$(( ( t - now ) / 86400 )); echo "headshotdc.com domain: $domain_days days"; else echo "headshotdc.com domain: unread"; fi
           echo "SSL_DAYS=$ssl_days" >> "$GITHUB_ENV"; echo "DOMAIN_DAYS=$domain_days" >> "$GITHUB_ENV"
-          if [ -n "$ssl_days" ] && [ "$ssl_days" -lt 14 ]; then echo "::error::A certificate expires in $ssl_days days"; echo "FAIL_EXPIRY=1" >> "$GITHUB_ENV"; fi
-          if [ -n "$domain_days" ] && [ "$domain_days" -lt 30 ]; then echo "::error::headshotdc.com expires in $domain_days days"; echo "FAIL_EXPIRY=1" >> "$GITHUB_ENV"; fi
+          if [ -n "$ssl_days" ] && [ "$ssl_days" -lt 14 ]; then echo "::warning::A certificate expires in $ssl_days days"; fi
+          if [ -n "$domain_days" ] && [ "$domain_days" -lt 30 ]; then echo "::warning::headshotdc.com expires in $domain_days days"; fi
+          exit 0
 
       - name: Report the beat
         env:
@@ -69,7 +75,6 @@ jobs:
 
       - name: Verdict
         run: |
-          if [ -n "$FAIL_EXPIRY" ]; then echo "::error::A certificate or the domain is close to expiring - renew it."; exit 1; fi
           if [ -n "$FAIL_HEARTBEAT" ] || [ -n "$FAIL_WWW" ]; then
             echo "::error::Watchdog checks FAILED - this failed run is the alarm (GitHub emails it)."
             exit 1
@@ -94,12 +99,20 @@ jobs:
           REPO: ${{ github.repository }}
           FORCE: ${{ inputs.force_renew }}
         run: |
-          last=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date') || { echo "::error::could not read the last commit"; exit 1; }
-          age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+          # a passing GitHub API hiccup must not fail the run (that emails): the next run reads again, and the
+          # portal alarms at 45 days if renewals keep failing. Only a FORCED renewal that cannot run fails.
+          last=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date' 2>/dev/null) || last=""
+          lt=$(date -u -d "$last" +%s 2>/dev/null) || lt=""
+          if [ -z "$last" ] || [ -z "$lt" ]; then
+            if [ "$FORCE" = "true" ]; then echo "::error::could not read the last commit for a forced renewal"; exit 1; fi
+            echo "::warning::could not read the last commit; the next run tries again"; exit 0
+          fi
+          age=$(( ( $(date -u +%s) - lt ) / 86400 ))
           echo "last commit: $last ($age days ago; GitHub switches the schedule off at 60)"
           if [ "$FORCE" != "true" ] && [ "$age" -lt 25 ]; then echo "not due (renews at 25 days)"; exit 0; fi
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          sha=$(gh api "repos/$REPO/contents/.keepalive" --jq .sha 2>/dev/null || true)
+          sha=$(gh api "repos/$REPO/contents/.keepalive" --jq .sha 2>/dev/null) || sha=""
+          case "$sha" in *[!0-9a-f]*) sha="";; esac
           content=$(printf 'renewed %s · keeps GitHub from switching the Watchdog schedule off (60 days with no commit)\n' "$now" | base64 -w0)
           args=(-X PUT "repos/$REPO/contents/.keepalive" -f message="keepalive: renew repository activity ($age days since the last commit)" -f content="$content")
           [ -n "$sha" ] && args+=(-f sha="$sha")
