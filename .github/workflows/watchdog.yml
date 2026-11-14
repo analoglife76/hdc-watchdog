@@ -42,15 +42,34 @@ jobs:
           echo "www status: $code"
           if [ "$code" != "200" ]; then echo "::error::www answered $code"; echo "FAIL_WWW=1" >> "$GITHUB_ENV"; fi
 
+      # n1190 · certificate and domain expiry, read from outside (Better Stack's own expiry checks are a paid
+      # feature). The soonest certificate of the two hosts, and headshotdc.com's registration from the .com
+      # registry (RDAP). Under 14 days for a certificate or 30 for the domain fails the run, which GitHub
+      # emails. An unreadable date is reported as unread and does not fail the run on its own.
+      - name: Certificate and domain expiry
+        run: |
+          now=$(date -u +%s); ssl_days=""
+          for h in staff.headshotdc.com www.headshotdc.com; do
+            end=$(echo | timeout 15 openssl s_client -servername "$h" -connect "$h:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -n "$end" ]; then d=$(( ( $(date -u -d "$end" +%s) - now ) / 86400 )); echo "$h certificate: $d days"; if [ -z "$ssl_days" ] || [ "$d" -lt "$ssl_days" ]; then ssl_days=$d; fi
+            else echo "$h certificate: unread"; fi
+          done
+          dom=$(curl -s --max-time 20 https://rdap.verisign.com/com/v1/domain/headshotdc.com | jq -r '.events[]? | select(.eventAction=="expiration") | .eventDate' 2>/dev/null | head -1)
+          domain_days=""; if [ -n "$dom" ]; then domain_days=$(( ( $(date -u -d "$dom" +%s) - now ) / 86400 )); echo "headshotdc.com domain: $domain_days days"; else echo "headshotdc.com domain: unread"; fi
+          echo "SSL_DAYS=$ssl_days" >> "$GITHUB_ENV"; echo "DOMAIN_DAYS=$domain_days" >> "$GITHUB_ENV"
+          if [ -n "$ssl_days" ] && [ "$ssl_days" -lt 14 ]; then echo "::error::A certificate expires in $ssl_days days"; echo "FAIL_EXPIRY=1" >> "$GITHUB_ENV"; fi
+          if [ -n "$domain_days" ] && [ "$domain_days" -lt 30 ]; then echo "::error::headshotdc.com expires in $domain_days days"; echo "FAIL_EXPIRY=1" >> "$GITHUB_ENV"; fi
+
       - name: Report the beat
         env:
           BEAT_KEY: ${{ secrets.WD_BEAT_KEY }}
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H "x-hdc-beat-key: $BEAT_KEY" "https://staff.headshotdc.com/api/watchdog/beat?via=github" 2>/dev/null) || code=000
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H "x-hdc-beat-key: $BEAT_KEY" "https://staff.headshotdc.com/api/watchdog/beat?via=github&ssl_days=${SSL_DAYS}&domain_days=${DOMAIN_DAYS}" 2>/dev/null) || code=000
           echo "beat: $code"
 
       - name: Verdict
         run: |
+          if [ -n "$FAIL_EXPIRY" ]; then echo "::error::A certificate or the domain is close to expiring - renew it."; exit 1; fi
           if [ -n "$FAIL_HEARTBEAT" ] || [ -n "$FAIL_WWW" ]; then
             echo "::error::Watchdog checks FAILED - this failed run is the alarm (GitHub emails it)."
             exit 1
