@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      force_renew:
+        description: 'Renew the repository activity now, whatever its age (the portal uses this as a repair)'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -30,17 +35,20 @@ jobs:
             *'"alarm_armed":true'*) echo "edge alarm: armed";;
             *) echo "::error::Edge alarm not armed"; echo "FAIL_HEARTBEAT=1" >> "$GITHUB_ENV";;
           esac
+
       - name: Storefront
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://www.headshotdc.com/" 2>/dev/null) || code=000
           echo "www status: $code"
           if [ "$code" != "200" ]; then echo "::error::www answered $code"; echo "FAIL_WWW=1" >> "$GITHUB_ENV"; fi
+
       - name: Report the beat
         env:
           BEAT_KEY: ${{ secrets.WD_BEAT_KEY }}
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H "x-hdc-beat-key: $BEAT_KEY" "https://staff.headshotdc.com/api/watchdog/beat?via=github" 2>/dev/null) || code=000
           echo "beat: $code"
+
       - name: Verdict
         run: |
           if [ -n "$FAIL_HEARTBEAT" ] || [ -n "$FAIL_WWW" ]; then
@@ -48,3 +56,33 @@ jobs:
             exit 1
           fi
           echo "all green"
+
+  # n1190 · GitHub switches off a PUBLIC repo's schedule after 60 days with no commit, and a switched-off
+  # workflow refuses workflow_dispatch too. Runs the portal starts do not count as activity. So this job
+  # commits a one-line stamp (.keepalive) once the last commit is 25+ days old: about once a month, far
+  # inside the 60. It touches nothing else. Its token is this repo's own GITHUB_TOKEN with contents:write
+  # for this job only; the watch job above keeps no permissions at all. A failed renewal fails the run
+  # (GitHub emails it) and the portal raises its own alert at 45 days.
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - name: Renew repository activity when due
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force_renew }}
+        run: |
+          last=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date') || { echo "::error::could not read the last commit"; exit 1; }
+          age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+          echo "last commit: $last ($age days ago; GitHub switches the schedule off at 60)"
+          if [ "$FORCE" != "true" ] && [ "$age" -lt 25 ]; then echo "not due (renews at 25 days)"; exit 0; fi
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          sha=$(gh api "repos/$REPO/contents/.keepalive" --jq .sha 2>/dev/null || true)
+          content=$(printf 'renewed %s · keeps GitHub from switching the Watchdog schedule off (60 days with no commit)\n' "$now" | base64 -w0)
+          args=(-X PUT "repos/$REPO/contents/.keepalive" -f message="keepalive: renew repository activity ($age days since the last commit)" -f content="$content")
+          [ -n "$sha" ] && args+=(-f sha="$sha")
+          gh api "${args[@]}" --jq '.commit.sha' || { echo "::error::renewal commit failed"; exit 1; }
+          echo "renewed at $now"
